@@ -237,6 +237,119 @@ function detectCandlestickPatterns(opens: number[], highs: number[], lows: numbe
   return patterns;
 }
 
+interface CacheEntry {
+  data: any;
+  timestamp: number;
+}
+
+const priceCache: Record<string, CacheEntry> = {};
+const candleCache: Record<string, CacheEntry> = {};
+const CACHE_DURATION_MS = 15000; // 15-second caching layer to respect Twelve Data API rate limits
+
+function mapSymbolToTwelveData(symbol: string): string {
+  const s = String(symbol).toUpperCase();
+  switch (s) {
+    case "XAUUSD": return "XAU/USD";
+    case "EURUSDT": return "EUR/USD";
+    case "GBPUSDT": return "GBP/USD";
+    case "AUDUSDT": return "AUD/USD";
+    case "EURGBP": return "EUR/GBP";
+    case "GBPJPY": return "GBP/JPY";
+    case "USDTJPY": return "USD/JPY";
+    default: return s;
+  }
+}
+
+function mapIntervalToTwelveData(interval: string): string {
+  const i = String(interval).toLowerCase();
+  switch (i) {
+    case "1m": return "1min";
+    case "3m": return "5min";
+    case "5m": return "5min";
+    case "15m": return "15min";
+    case "30m": return "30min";
+    case "1h": return "1h";
+    case "4h": return "4h";
+    case "1d": return "1day";
+    default: return "1min";
+  }
+}
+
+async function fetchTwelveDataPrice(symbol: string): Promise<number> {
+  const apiKey = process.env.TWELVE_DATA_API_KEY || "8cb2206e8d6b4a26ad139f7236b5d79b";
+  const mappedSymbol = mapSymbolToTwelveData(symbol);
+  
+  const cacheKey = mappedSymbol;
+  const now = Date.now();
+  
+  if (priceCache[cacheKey] && (now - priceCache[cacheKey].timestamp < CACHE_DURATION_MS)) {
+    return priceCache[cacheKey].data;
+  }
+
+  const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(mappedSymbol)}&apikey=${apiKey}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Twelve Data API price error: ${response.statusText}`);
+  }
+  
+  const data = await response.json() as any;
+  if (data && data.price) {
+    const currentPrice = parseFloat(data.price);
+    if (!isNaN(currentPrice)) {
+      priceCache[cacheKey] = {
+        data: currentPrice,
+        timestamp: now
+      };
+      return currentPrice;
+    }
+  }
+  
+  throw new Error(`Twelve Data returned error or invalid price for ${mappedSymbol}: ${JSON.stringify(data)}`);
+}
+
+async function fetchTwelveDataCandles(symbol: string, interval: string): Promise<any[]> {
+  const apiKey = process.env.TWELVE_DATA_API_KEY || "8cb2206e8d6b4a26ad139f7236b5d79b";
+  const mappedSymbol = mapSymbolToTwelveData(symbol);
+  const mappedInterval = mapIntervalToTwelveData(interval);
+  
+  const cacheKey = `${mappedSymbol}_${mappedInterval}`;
+  const now = Date.now();
+  
+  if (candleCache[cacheKey] && (now - candleCache[cacheKey].timestamp < CACHE_DURATION_MS)) {
+    console.log(`[Cache Hit] Returning cached Technical Candlestick series for ${cacheKey}`);
+    return candleCache[cacheKey].data;
+  }
+
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(mappedSymbol)}&interval=${mappedInterval}&apikey=${apiKey}&outputsize=100`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Twelve Data API error: ${response.statusText}`);
+  }
+  
+  const data = await response.json() as any;
+  if (!data || data.status === "error" || !Array.isArray(data.values)) {
+    throw new Error(data?.message || `Twelve Data returned error status: ${JSON.stringify(data)}`);
+  }
+
+  // Twelve Data yields newest-to-oldest klines. Map and reverse to chronological order (oldest-to-newest)
+  const reversedValues = [...data.values].reverse();
+  const rawKlines = reversedValues.map((v: any) => [
+    new Date(v.datetime).getTime(),
+    v.open,
+    v.high,
+    v.low,
+    v.close,
+    v.volume || "1000"
+  ]);
+
+  candleCache[cacheKey] = {
+    data: rawKlines,
+    timestamp: now
+  };
+
+  return rawKlines;
+}
+
 // REST endpoints
 app.get("/api/price", async (req, res) => {
   const { symbol } = req.query;
@@ -244,10 +357,32 @@ app.get("/api/price", async (req, res) => {
     return res.status(400).json({ error: "Missing symbol param" });
   }
 
+  const s = String(symbol).toUpperCase();
+
+  // 1. Try to fetch from Twelve Data for Forex/Gold pairs first
+  const isForexOrGold = ["EURUSDT", "GBPUSDT", "AUDUSDT", "EURGBP", "GBPJPY", "USDTJPY", "XAUUSD"].includes(s);
+  if (isForexOrGold) {
+    try {
+      const realPrice = await fetchTwelveDataPrice(s);
+      return res.json({ symbol: s, price: realPrice });
+    } catch (tdError: any) {
+      console.warn(`[Twelve Data Price Fallback] Error fetching ${s}, trying Binance/Synthetic Walk:`, tdError.message);
+    }
+  }
+
+  // 2. Otherwise, look up Binance API
   try {
-    const s = String(symbol).toUpperCase();
+    const binanceUrl = `https://api.binance.com/api/v3/ticker/price?symbol=${s}`;
+    const response = await fetch(binanceUrl);
+    if (!response.ok) {
+      throw new Error(`Binance responded with status ${response.status}`);
+    }
+    const data = await response.json() as { symbol: string; price: string };
+    return res.json({ symbol: data.symbol, price: parseFloat(data.price) });
+  } catch (error: any) {
+    console.error("Error fetching live ticker price:", error.message);
     
-    // Check if it's a popular forex pair to fallback safely
+    // 3. Absolute backup: Synthetic baseline price with random walk
     const mockPrices: Record<string, number> = {
       EURUSDT: 1.0854,
       GBPUSDT: 1.2678,
@@ -257,28 +392,10 @@ app.get("/api/price", async (req, res) => {
       USDTJPY: 156.42,
       XAUUSD: 2320.50,
     };
-
-    if (mockPrices[s] !== undefined) {
-      // In case we want immediate or randomized calculation during API unavailability
-      const basePrice = mockPrices[s];
-      const randomizedPrice = basePrice * (1 + (Math.random() * 0.0004 - 0.0002));
-      const decimals = basePrice < 2 ? 5 : 2;
-      return res.json({ symbol: s, price: parseFloat(randomizedPrice.toFixed(decimals)) });
-    }
-
-    const binanceUrl = `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`;
-    const response = await fetch(binanceUrl);
-    if (!response.ok) {
-      throw new Error(`Binance responded with status ${response.status}`);
-    }
-    const data = await response.json() as { symbol: string; price: string };
-    return res.json({ symbol: data.symbol, price: parseFloat(data.price) });
-  } catch (error: any) {
-    console.error("Error fetching live ticker price:", error.message);
-    const s = String(symbol).toUpperCase();
-    const fallbackPrice = 1.0;
-    const randomizedPrice = fallbackPrice * (1 + (Math.random() * 0.0004 - 0.0002));
-    return res.json({ symbol: s, price: parseFloat(randomizedPrice.toFixed(4)) });
+    const basePrice = mockPrices[s] || 1.0;
+    const randomizedPrice = basePrice * (1 + (Math.random() * 0.0004 - 0.0002));
+    const decimals = basePrice < 2 ? 5 : basePrice < 505 ? 4 : 2;
+    return res.json({ symbol: s, price: parseFloat(randomizedPrice.toFixed(decimals)) });
   }
 });
 
@@ -491,39 +608,54 @@ app.post("/api/signal", async (req, res) => {
       };
     } else {
       let rawKlines: Array<any> = [];
+      const s = String(symbol).toUpperCase();
+      const isForexOrGold = ["EURUSDT", "GBPUSDT", "AUDUSDT", "EURGBP", "GBPJPY", "USDTJPY", "XAUUSD"].includes(s);
 
-      if (symbol.includes("_OTC") || forexBasePrices[symbol] !== undefined) {
-        const startPrice = forexBasePrices[symbol] || 1.0;
-        let price = startPrice;
-        let curTime = Date.now() - 100 * 60 * 1000;
-        
-        for (let i = 0; i < 100; i++) {
-          const change = price * (Math.random() * 0.002 - 0.001);
-          const open = price;
-          const close = price + change;
-          const highValue = Math.max(open, close) + (price * Math.random() * 0.0005);
-          const lowValue = Math.min(open, close) - (price * Math.random() * 0.0005);
-          const volumeValue = 1000 + Math.random() * 9000;
-
-          rawKlines.push([
-            curTime,
-            open.toString(),
-            highValue.toString(),
-            lowValue.toString(),
-            close.toString(),
-            volumeValue.toString()
-          ]);
-
-          price = close;
-          curTime += 60 * 1000;
+      let loadedViaTwelveData = false;
+      if (isForexOrGold) {
+        try {
+          rawKlines = await fetchTwelveDataCandles(s, interval);
+          loadedViaTwelveData = true;
+          console.log(`[Success] Loaded real-time technical indicators from Twelve Data for ${s} at ${interval}`);
+        } catch (tdError: any) {
+          console.warn(`[Twelve Data Fallback] Failed to fetch live candles for ${s}, activating fallback:`, tdError.message);
         }
-      } else {
-        const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=100`;
-        const response = await fetch(binanceUrl);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch candlestick data from Binance: ${response.statusText}`);
+      }
+
+      if (!loadedViaTwelveData) {
+        if (symbol.includes("_OTC") || forexBasePrices[symbol] !== undefined) {
+          const startPrice = forexBasePrices[symbol] || 1.0;
+          let price = startPrice;
+          let curTime = Date.now() - 100 * 60 * 1000;
+          
+          for (let i = 0; i < 100; i++) {
+            const change = price * (Math.random() * 0.002 - 0.001);
+            const open = price;
+            const close = price + change;
+            const highValue = Math.max(open, close) + (price * Math.random() * 0.0005);
+            const lowValue = Math.min(open, close) - (price * Math.random() * 0.0005);
+            const volumeValue = 1000 + Math.random() * 9000;
+
+            rawKlines.push([
+              curTime,
+              open.toString(),
+              highValue.toString(),
+              lowValue.toString(),
+              close.toString(),
+              volumeValue.toString()
+            ]);
+
+            price = close;
+            curTime += 60 * 1000;
+          }
+        } else {
+          const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=100`;
+          const response = await fetch(binanceUrl);
+          if (!response.ok) {
+            throw new Error(`Failed to fetch candlestick data from Binance: ${response.statusText}`);
+          }
+          rawKlines = await response.json() as Array<any>;
         }
-        rawKlines = await response.json() as Array<any>;
       }
 
       if (!Array.isArray(rawKlines) || rawKlines.length < 30) {
