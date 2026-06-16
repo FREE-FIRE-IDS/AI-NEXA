@@ -197,11 +197,30 @@ export default function App() {
       clearInterval(interval);
 
       if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || "Failed to analyze trade parameters.");
+        let errorMsg = "Failed to analyze trade parameters.";
+        try {
+          const contentType = res.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const errData = await res.json();
+            errorMsg = errData.error || errorMsg;
+          } else {
+            const errText = await res.text();
+            if (errText && errText.trim().length > 0 && errText.length < 250) {
+              errorMsg = errText.trim();
+            }
+          }
+        } catch (_) {}
+        throw new Error(errorMsg);
       }
 
-      const SignalResponse: TradingSignal = await res.json();
+      const responseText = await res.text();
+      let SignalResponse: TradingSignal;
+      try {
+        SignalResponse = JSON.parse(responseText);
+      } catch (parseErr) {
+        throw new Error("Invalid server response. Potential network latency or function initialization timeout on Vercel.");
+      }
+
       setSignal(SignalResponse);
       setAnalysisProgress(100);
 
