@@ -1,0 +1,8 @@
+{
+  "name": "AI Nexa",
+  "description": "An advanced market analysis tool utilizing Gemini AI to synthesize real-time technical indicators and provide highly accurate trade signals with dynamic duration timers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
