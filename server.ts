@@ -11,6 +11,22 @@ if (typeof dns.setDefaultResultOrder === "function") {
   dns.setDefaultResultOrder("ipv4first");
 }
 
+async function fetchWithTimeout(url: string, options: any = {}, timeoutMs = 2800): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    throw error;
+  }
+}
+
 const app = express();
 const PORT = 3000;
 
@@ -286,7 +302,7 @@ async function fetchTwelveDataPrice(symbol: string): Promise<number> {
   }
 
   const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(mappedSymbol)}&apikey=${apiKey}`;
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url);
   if (!response.ok) {
     throw new Error(`Twelve Data API price error: ${response.statusText}`);
   }
@@ -320,7 +336,7 @@ async function fetchTwelveDataCandles(symbol: string, interval: string): Promise
   }
 
   const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(mappedSymbol)}&interval=${mappedInterval}&apikey=${apiKey}&outputsize=100`;
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url);
   if (!response.ok) {
     throw new Error(`Twelve Data API error: ${response.statusText}`);
   }
@@ -372,7 +388,7 @@ app.get("/api/price", async (req, res) => {
   // 2. Otherwise, look up Binance API
   try {
     const binanceUrl = `https://api.binance.com/api/v3/ticker/price?symbol=${s}`;
-    const response = await fetch(binanceUrl);
+    const response = await fetchWithTimeout(binanceUrl);
     if (!response.ok) {
       throw new Error(`Binance responded with status ${response.status}`);
     }
@@ -649,7 +665,7 @@ app.post("/api/signal", async (req, res) => {
           }
         } else {
           const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=100`;
-          const response = await fetch(binanceUrl);
+          const response = await fetchWithTimeout(binanceUrl);
           if (!response.ok) {
             throw new Error(`Failed to fetch candlestick data from Binance: ${response.statusText}`);
           }
@@ -818,20 +834,20 @@ app.post("/api/signal", async (req, res) => {
       gResult = generateLocalSignalFallback(symbol, interval, indicatorsData);
       geminiErrorPayload = "Missing GEMINI_API_KEY configuration secret.";
     } else {
-      try {
-        // First attempt: Call Primary Gemini AI (gemini-3.5-flash)
-        const chatCompletion = await getGoogleGenAI().models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: analysisPrompt,
-          config: aiConfig,
-        });
-
-        const cleanText = chatCompletion.text.trim();
-        gResult = JSON.parse(cleanText);
-      } catch (geminiError: any) {
-        console.log(`[Diagnostic] Primary model completed: ${geminiError.message || geminiError}. Routing to secondary fallback...`);
-        
+      const runGeminiWithFallback = async () => {
         try {
+          // First attempt: Call Primary Gemini AI (gemini-3.5-flash)
+          const chatCompletion = await getGoogleGenAI().models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: analysisPrompt,
+            config: aiConfig,
+          });
+
+          const cleanText = chatCompletion.text.trim();
+          return JSON.parse(cleanText);
+        } catch (geminiError: any) {
+          console.log(`[Diagnostic] Primary model completed: ${geminiError.message || geminiError}. Routing to secondary fallback...`);
+          
           // Second attempt: Call Backup Gemini AI (gemini-3.1-flash-lite)
           const backupCompletion = await getGoogleGenAI().models.generateContent({
             model: "gemini-3.1-flash-lite",
@@ -840,21 +856,33 @@ app.post("/api/signal", async (req, res) => {
           });
 
           const cleanText = backupCompletion.text.trim();
-          gResult = JSON.parse(cleanText);
           fallbackToLiteSucceeded = true;
           console.log("[Diagnostic] Handled successfully via secondary fallback option.");
-        } catch (backupError: any) {
-          console.log(`[Diagnostic] Secondary fallback completed, routing to local math core: ${backupError.message || backupError}`);
-          
-          let errorMsgStr = geminiError.message || String(geminiError);
-          if (typeof geminiError === "object" && geminiError !== null) {
-            try {
-              errorMsgStr = JSON.stringify(geminiError);
-            } catch (_) {}
-          }
-          geminiErrorPayload = errorMsgStr;
-          gResult = generateLocalSignalFallback(symbol, interval, indicatorsData);
+          return JSON.parse(cleanText);
         }
+      };
+
+      try {
+        // Enforce strict 4.8 second timeout constraint to safe-keep Vercel execution bounds
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Gemini API call timed out")), 4800)
+        );
+
+        gResult = await Promise.race([
+          runGeminiWithFallback(),
+          timeoutPromise
+        ]);
+      } catch (geminiError: any) {
+        console.log(`[Diagnostic] AI execution exceeded bounds or failed, routing to local math core: ${geminiError.message || geminiError}`);
+        
+        let errorMsgStr = geminiError.message || String(geminiError);
+        if (typeof geminiError === "object" && geminiError !== null) {
+          try {
+            errorMsgStr = JSON.stringify(geminiError);
+          } catch (_) {}
+        }
+        geminiErrorPayload = errorMsgStr;
+        gResult = generateLocalSignalFallback(symbol, interval, indicatorsData);
       }
     }
 
