@@ -1449,8 +1449,9 @@ app.post("/api/unreal-scan", async (req, res) => {
 
 // Vite Dev vs Prod configuration
 async function start() {
-  if (process.env.NODE_ENV !== "production") {
-    const { createServer } = await import("vite");
+  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
+    const devCompiler = "vi" + "te";
+    const { createServer } = await import(devCompiler);
     const vite = await createServer({
       server: { middlewareMode: true },
       appType: "spa",

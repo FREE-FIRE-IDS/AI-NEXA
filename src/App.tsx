@@ -635,7 +635,7 @@ export default function App() {
 
               <div className="space-y-3.5">
                 <h1 className="text-4xl sm:text-5xl font-black tracking-[0.15em] text-transparent bg-clip-text bg-gradient-to-r from-white via-slate-100 to-amber-300 font-sans shadow-sm filter drop-shadow-[0_0_15px_rgba(245,158,11,0.25)]">
-                  AI NEXA
+                  AI NEXA | AHAD
                 </h1>
                 <p className="text-xs font-mono font-bold tracking-[0.25em] uppercase text-amber-400">
                   CREATED BY AHAD OFFICIAL
@@ -677,7 +677,7 @@ export default function App() {
             N
           </div>
           <span className="text-xl font-extrabold tracking-tight text-white flex items-center">
-            AI <span className="text-indigo-400 ml-1">NEXA</span>
+            AI <span className="text-indigo-400 ml-1">NEXA | AHAD</span>
             <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 bg-indigo-500/15 text-indigo-300 rounded border border-indigo-500/20 ml-2.5 tracking-wider hidden sm:inline">
               PRO
             </span>
