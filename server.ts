@@ -478,6 +478,8 @@ async function fetchTwelveDataPrice(symbol: string): Promise<number> {
   }
 }
 
+let twelveDataCircuitTrippedUntil = 0;
+
 async function fetchTwelveDataCandles(symbol: string, interval: string): Promise<any[]> {
   const apiKey = process.env.TWELVE_DATA_API_KEY || "8cb2206e8d6b4a26ad139f7236b5d79b";
   const mappedSymbol = mapSymbolToTwelveData(symbol);
@@ -491,15 +493,30 @@ async function fetchTwelveDataCandles(symbol: string, interval: string): Promise
     return candleCache[cacheKey].data;
   }
 
+  if (now < twelveDataCircuitTrippedUntil) {
+    console.log(`[Circuit Breaker Active] Bypassing Twelve Data outgoing request for ${mappedSymbol} due to active 429 rate limits, rendering high-fidelity synthetic candles instantly.`);
+    throw new Error("Twelve Data rate-limit block (Circuit Breaker active)");
+  }
+
   try {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(mappedSymbol)}&interval=${mappedInterval}&apikey=${apiKey}&outputsize=100`;
-    const response = await fetchWithTimeout(url);
+    // Set a very tight timeout of 1000ms for candlestick fetch on Vercel so we don't hold the cloud function open
+    const response = await fetchWithTimeout(url, {}, 1000);
     if (!response.ok) {
+      if (response.status === 429) {
+        twelveDataCircuitTrippedUntil = Date.now() + 60000;
+        console.warn(`[Circuit Breaker Tripped] Twelve Data HTTP 429 rate limit hit. Bypassing outgoing queries for 60s.`);
+      }
       throw new Error(`Twelve Data API candles HTTP error: ${response.statusText}`);
     }
     
     const data = await response.json() as any;
     if (!data || data.status === "error" || !Array.isArray(data.values)) {
+      const isRateLimit = data?.code === 429 || String(data?.message || "").toLowerCase().includes("limit") || String(data?.message || "").toLowerCase().includes("speed");
+      if (isRateLimit) {
+        twelveDataCircuitTrippedUntil = Date.now() + 60000;
+        console.warn(`[Circuit Breaker Tripped] Twelve Data JSON error code 429 or limit hit. Bypassing outgoing queries for 60s.`);
+      }
       throw new Error(data?.message || `Twelve Data returned error status: ${JSON.stringify(data)}`);
     }
 
@@ -995,15 +1012,17 @@ app.post("/api/signal", async (req, res) => {
       };
 
       try {
-        // Enforce strict 15.0 second timeout constraint to safe-keep execution bounds under retry delays
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Gemini API call timed out")), 15000)
-        );
+        // Enforce strict 6.0 second timeout constraint to safe-keep execution bounds under retry delays on Vercel
+        let timerId: any = null;
+        const timeoutPromise = new Promise((_, reject) => {
+          timerId = setTimeout(() => reject(new Error("Gemini API call timed out")), 6000);
+        });
 
         gResult = await Promise.race([
           runGeminiWithFallback(),
           timeoutPromise
         ]);
+        if (timerId) clearTimeout(timerId);
       } catch (geminiError: any) {
         console.log(`[Diagnostic] AI execution exceeded bounds or failed, routing to local math core: ${geminiError.message || geminiError}`);
         
